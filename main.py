@@ -199,6 +199,21 @@ def _is_model_not_found_error(error_text: str) -> bool:
         )
     )
 
+
+def _is_screen_description_command(user_text: str) -> bool:
+    """Return True when user is clearly asking to describe on-screen content."""
+    normalized = user_text.lower().strip()
+    screen_keywords = [
+        "screen",
+        "display",
+        "monitor",
+        "on my screen",
+        "in my screen",
+        "what is on my screen",
+    ]
+    describe_keywords = ["describe", "what", "read", "tell", "see"]
+    return any(k in normalized for k in screen_keywords) and any(k in normalized for k in describe_keywords)
+
 # --- Helper Functions ---
 
 
@@ -827,6 +842,20 @@ async def main_conversation_loop():
 
         # Log user input to the file
         log_message(user_input, "User")
+
+        # Deterministic shortcut: directly handle common accessibility command.
+        if _is_screen_description_command(user_input):
+            screen_result = await describe_screen_content(user_input)
+            print(screen_result)
+            await speak(screen_result)
+            log_message(screen_result, "Dhrishti")
+            conversation_history.append(
+                {"role": "user", "parts": [{"text": user_input}]}
+            )
+            conversation_history.append(
+                {"role": "model", "parts": [{"text": screen_result}]}
+            )
+            continue
 
         # Add user input to conversation history for the current turn
         conversation_history.append(
