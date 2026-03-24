@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+*.egg-info/
+.build/
+.dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment & secrets
+.env
+.env.*
+credentials.json
+token.json
+*.pem
+*.key
+
+# Logs and runtime artifacts
+*.log
+conversation_log.txt
+output.mp3
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test and cache
+.pytest_cache/
+.cache/
+
+# Screenshots and media
+screenshots/
+*.png
+*.jpg
+*.jpeg
+
+# Selenium/WebDriver (if any binaries are saved locally)
+chromedriver*
+geckodriver*
+
+# Distribution/build
+build/
+dist/
+.qodo/
