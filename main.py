@@ -41,7 +41,9 @@ from googlesearch import search
 import base64
 import io
 import os.path
+import webbrowser
 from email.mime.text import MIMEText
+from urllib.parse import quote_plus
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -308,6 +310,222 @@ def _is_screen_description_command(user_text: str) -> bool:
     return any(k in normalized for k in screen_keywords) and any(k in normalized for k in describe_keywords)
 
 
+def _parse_whatsapp_workflow_command(user_text: str, allow_context: bool = False):
+    """Parse direct WhatsApp workflow commands from natural language.
+
+    Supported examples:
+    - "open whatsapp"
+    - "open whatsapp go to user A"
+    - "open whatsapp go to user A type hi"
+    - "send whatsapp message to mom hello"
+    """
+    text = (user_text or "").strip()
+    lowered = text.lower()
+
+    has_whatsapp_keyword = "whatsapp" in lowered or "whats app" in lowered
+    if not has_whatsapp_keyword and not allow_context:
+        return None
+
+    contact_name = None
+    message_text = None
+
+    message_to_contact_match = re.search(
+        r"(?:type|send|message)\s+(.+?)\s+to\s+(?:user\s+)?(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if message_to_contact_match:
+        message_text = message_to_contact_match.group(1).strip(" \t\n\r\"'")
+        contact_name = message_to_contact_match.group(2).strip(" \t\n\r.,:;!?\"'")
+        if contact_name and message_text:
+            return {
+                "open_only": False,
+                "contact_name": contact_name,
+                "message_text": message_text,
+            }
+
+    send_match = re.search(
+        r"(?:send\s+whats\s*app\s+message|send\s+whatsapp\s+message|send\s+whatsapp)\s+to\s+(?:user\s+)?(.+?)\s+(?:saying\s+)?(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if send_match:
+        contact_name = send_match.group(1).strip(" \t\n\r.,:;!?\"'")
+        message_text = send_match.group(2).strip(" \t\n\r\"'")
+        if contact_name and message_text:
+            return {
+                "open_only": False,
+                "contact_name": contact_name,
+                "message_text": message_text,
+            }
+
+    contact_match = re.search(
+        r"(?:go\s+to|to|chat\s+with|open\s+chat\s+with)\s+(?:user\s+)?(.+?)(?=\s+(?:and\s+)?(?:type|send|message)\b|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if contact_match:
+        contact_name = contact_match.group(1).strip(" \t\n\r.,:;!?\"'")
+
+    message_match = re.search(
+        r"(?:type|send|message)\s+(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if message_match:
+        message_text = message_match.group(1).strip(" \t\n\r\"'")
+
+    if not contact_name and not message_text and (
+        "open whatsapp" in lowered or "open whats app" in lowered
+    ):
+        return {"open_only": True, "contact_name": None, "message_text": None}
+
+    # Context mode: after WhatsApp is opened, allow short follow-up commands.
+    if allow_context and not has_whatsapp_keyword:
+        if contact_name or message_text:
+            return {
+                "open_only": False,
+                "contact_name": contact_name,
+                "message_text": message_text,
+            }
+        if lowered.startswith("open"):
+            return {"open_only": True, "contact_name": None, "message_text": None}
+
+    if contact_name or message_text:
+        return {
+            "open_only": False,
+            "contact_name": contact_name,
+            "message_text": message_text,
+        }
+
+    return None
+
+
+WEB_TARGET_URLS = {
+    "gmail": "https://mail.google.com/",
+    "instagram": "https://www.instagram.com/",
+    "reddit": "https://www.reddit.com/",
+    "chatgpt": "https://chatgpt.com/",
+    "youtube": "https://www.youtube.com/",
+}
+
+
+APP_ALIASES = {
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "gmail": "gmail",
+    "google mail": "gmail",
+    "instagram": "instagram",
+    "insta": "instagram",
+    "reddit": "reddit",
+    "whatsapp": "whatsapp",
+    "whats app": "whatsapp",
+}
+
+
+def _normalize_target_name(raw_target: str) -> str:
+    target = (raw_target or "").strip().lower()
+    return APP_ALIASES.get(target, target)
+
+
+def _parse_universal_app_command(user_text: str, allow_context: bool = False, active_target: str = ""):
+    """Parse generic app operations like open, search, and type across apps."""
+    text = (user_text or "").strip()
+    lowered = text.lower()
+
+    # open <target>
+    open_match = re.search(r"^open\s+(.+?)(?:\s+and\s+(search|type)\s+(.+))?$", text, flags=re.IGNORECASE)
+    if open_match:
+        target = _normalize_target_name(open_match.group(1).strip(" \t\n\r.,:;!?\"'"))
+        action = (open_match.group(2) or "").strip().lower()
+        tail = (open_match.group(3) or "").strip(" \t\n\r\"'")
+        return {
+            "target": target,
+            "open": True,
+            "search_query": tail if action == "search" and tail else None,
+            "type_text": tail if action == "type" and tail else None,
+        }
+
+    # open app <target>
+    open_app_match = re.search(r"^open\s+app\s+(.+)$", text, flags=re.IGNORECASE)
+    if open_app_match:
+        target = _normalize_target_name(open_app_match.group(1).strip(" \t\n\r.,:;!?\"'"))
+        return {"target": target, "open": True, "search_query": None, "type_text": None}
+
+    # search <query> [in <target>]
+    search_match = re.search(r"^search\s+(.+?)(?:\s+in\s+(.+))?$", text, flags=re.IGNORECASE)
+    if search_match:
+        search_query = search_match.group(1).strip(" \t\n\r\"'")
+        explicit_target = _normalize_target_name((search_match.group(2) or "").strip()) if search_match.group(2) else ""
+        target = explicit_target or (active_target if allow_context else "")
+        if target:
+            return {"target": target, "open": False, "search_query": search_query, "type_text": None}
+
+    # type <text> [in|to <target>]
+    type_match = re.search(r"^type\s+(.+?)(?:\s+(?:in|to)\s+(.+))?$", text, flags=re.IGNORECASE)
+    if type_match:
+        type_text = type_match.group(1).strip(" \t\n\r\"'")
+        explicit_target = _normalize_target_name((type_match.group(2) or "").strip()) if type_match.group(2) else ""
+        target = explicit_target or (active_target if allow_context else "")
+        if target:
+            return {"target": target, "open": False, "search_query": None, "type_text": type_text}
+
+    # context-only shortcuts
+    if allow_context and active_target:
+        short_type_match = re.search(r"^(?:send|message)\s+(.+)$", text, flags=re.IGNORECASE)
+        if short_type_match:
+            return {
+                "target": active_target,
+                "open": False,
+                "search_query": None,
+                "type_text": short_type_match.group(1).strip(" \t\n\r\"'"),
+            }
+
+        if lowered.startswith("open"):
+            return {"target": active_target, "open": True, "search_query": None, "type_text": None}
+
+    return None
+
+
+def _sanitize_vision_response(raw_text: str) -> str:
+    """Clean model output to remove meta-analysis and keep concise user-facing content."""
+    text = (raw_text or "").replace("\r", "").strip()
+    if not text:
+        return ""
+
+    filtered_lines = []
+    skip_prefixes = (
+        "the user wants",
+        "i need to",
+        "i should",
+        "i will",
+        "analysis:",
+        "main content analysis:",
+        "reasoning:",
+    )
+
+    for line in text.split("\n"):
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered.startswith(skip_prefixes):
+            continue
+        cleaned = cleaned.replace("**", "").lstrip("- ").strip()
+        if cleaned:
+            filtered_lines.append(cleaned)
+
+    compact = " ".join(filtered_lines) if filtered_lines else text
+    compact = re.sub(r"\s+", " ", compact).strip()
+
+    # Keep response short for screen-reader usability.
+    sentence_parts = re.split(r"(?<=[.!?])\s+", compact)
+    compact = " ".join(sentence_parts[:4]).strip()
+    if len(compact) > 420:
+        compact = compact[:420].rsplit(" ", 1)[0] + "..."
+    return compact
+
+
 def _hf_generate_text(prompt: str, max_tokens: int = 512) -> str:
     if not HF_API_KEY:
         return "Hugging Face API key is missing."
@@ -330,7 +548,7 @@ def _hf_generate_text(prompt: str, max_tokens: int = 512) -> str:
         choices = data.get("choices") or []
         if choices:
             message = choices[0].get("message") or {}
-            content = (message.get("content") or message.get("reasoning") or "").strip()
+            content = (message.get("content") or "").strip()
             return content or "No response from model."
         return "No response from model."
     except Exception as e:
@@ -370,7 +588,8 @@ def _hf_describe_image(pil_image: Image.Image, user_query: str) -> str:
         choices = data.get("choices") or []
         if choices:
             message = choices[0].get("message") or {}
-            text = (message.get("content") or message.get("reasoning") or "").strip()
+            text = (message.get("content") or "").strip()
+            text = _sanitize_vision_response(text)
             return text or "I could not describe the image."
         return "I could not describe the image."
     except Exception as e:
@@ -970,10 +1189,134 @@ async def call_whatsapp_contact(person_name: str, call_type: str = 'voice'):
         return f"Failed to initiate WhatsApp call to {person_name}. Error: {e}"
 
 
+async def execute_whatsapp_workflow(contact_name: str = None, message_text: str = None, send_now: bool = True) -> str:
+    """Open WhatsApp, optionally open a chat, type a message, and optionally send it."""
+    try:
+        print("\033[93mExecuting WhatsApp workflow command...\033[0m")
+
+        pyautogui.press("win")
+        await asyncio.sleep(0.4)
+        pyautogui.write("whatsapp")
+        await asyncio.sleep(0.4)
+        pyautogui.press("enter")
+        await asyncio.sleep(4)
+
+        if not contact_name and not message_text:
+            return "WhatsApp opened."
+
+        if contact_name:
+            pyautogui.hotkey("ctrl", "f")
+            await asyncio.sleep(0.5)
+            pyautogui.hotkey("ctrl", "a")
+            await asyncio.sleep(0.2)
+            pyautogui.press("backspace")
+            await asyncio.sleep(0.2)
+            pyautogui.write(contact_name, interval=0.08)
+            await asyncio.sleep(1.2)
+            pyautogui.press("enter")
+            await asyncio.sleep(0.8)
+
+        if message_text:
+            pyautogui.write(message_text, interval=0.03)
+            await asyncio.sleep(0.2)
+            if send_now:
+                pyautogui.press("enter")
+                if contact_name:
+                    return f"WhatsApp message sent to {contact_name}: {message_text}"
+                return f"WhatsApp message sent: {message_text}"
+
+            if contact_name:
+                return f"WhatsApp draft typed for {contact_name}: {message_text}"
+            return f"WhatsApp draft typed: {message_text}"
+
+        if contact_name:
+            return f"WhatsApp opened and chat selected: {contact_name}."
+
+        return "WhatsApp workflow completed."
+    except Exception as e:
+        return f"Failed to execute WhatsApp workflow. Error: {e}"
+
+
+async def execute_universal_app_workflow(
+    target: str,
+    open_target: bool = True,
+    search_query: str = None,
+    type_text: str = None,
+    send_now: bool = True,
+) -> str:
+    """Open and operate apps/websites with a common command style."""
+    target = _normalize_target_name(target)
+    if not target:
+        return "Please tell me which app or website to operate."
+
+    try:
+        if open_target:
+            if target in WEB_TARGET_URLS:
+                webbrowser.open(WEB_TARGET_URLS[target])
+                await asyncio.sleep(2)
+            elif target == "chrome":
+                pyautogui.press("win")
+                await asyncio.sleep(0.4)
+                pyautogui.write("chrome")
+                await asyncio.sleep(0.4)
+                pyautogui.press("enter")
+                await asyncio.sleep(2)
+            elif target == "whatsapp":
+                open_only_result = await execute_whatsapp_workflow()
+                if not search_query and not type_text:
+                    return open_only_result
+            else:
+                pyautogui.press("win")
+                await asyncio.sleep(0.4)
+                pyautogui.write(target)
+                await asyncio.sleep(0.4)
+                pyautogui.press("enter")
+                await asyncio.sleep(2)
+
+        if search_query:
+            if target == "reddit":
+                webbrowser.open(f"https://www.reddit.com/search/?q={quote_plus(search_query)}")
+                await asyncio.sleep(1.5)
+            elif target == "instagram":
+                webbrowser.open(f"https://www.instagram.com/explore/search/keyword/?q={quote_plus(search_query)}")
+                await asyncio.sleep(1.5)
+            elif target == "gmail":
+                webbrowser.open(f"https://mail.google.com/mail/u/0/#search/{quote_plus(search_query)}")
+                await asyncio.sleep(1.5)
+            else:
+                pyautogui.hotkey("ctrl", "l")
+                await asyncio.sleep(0.2)
+                pyautogui.write(search_query, interval=0.03)
+                await asyncio.sleep(0.2)
+                pyautogui.press("enter")
+                await asyncio.sleep(0.8)
+
+        if type_text:
+            pyautogui.write(type_text, interval=0.03)
+            await asyncio.sleep(0.2)
+            if send_now:
+                pyautogui.press("enter")
+
+        state_parts = []
+        if open_target:
+            state_parts.append(f"opened {target}")
+        if search_query:
+            state_parts.append(f"searched for {search_query}")
+        if type_text:
+            state_parts.append(f"typed message: {type_text}")
+        if not state_parts:
+            return f"{target} is ready."
+        return "Done: " + ", ".join(state_parts) + "."
+    except Exception as e:
+        return f"Failed to operate {target}. Error: {e}"
+
+
 AVAILABLE_TOOLS = [
     describe_webcam_view,
     describe_screen_content,
     send_whatsapp_message,
+    execute_whatsapp_workflow,
+    execute_universal_app_workflow,
     search_web,
     send_gmail_message,
     read_gmail_messages,
@@ -1000,6 +1343,8 @@ async def main_conversation_loop():
             f.write("")  # Create empty file
 
     conversation_history = []
+    whatsapp_context_active = False
+    active_app_target = ""
 
     # Load initial context from log file if it exists and is large
     if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 0:
@@ -1037,6 +1382,58 @@ async def main_conversation_loop():
 
         # Log user input to the file
         log_message(user_input, "User")
+
+        # Deterministic shortcut: direct WhatsApp workflow command.
+        whatsapp_cmd = _parse_whatsapp_workflow_command(
+            user_input,
+            allow_context=whatsapp_context_active,
+        )
+        if whatsapp_cmd is not None:
+            wa_result = await execute_whatsapp_workflow(
+                contact_name=whatsapp_cmd.get("contact_name"),
+                message_text=whatsapp_cmd.get("message_text"),
+                send_now=True,
+            )
+            whatsapp_context_active = True
+            print(wa_result)
+            await speak(wa_result)
+            log_message(wa_result, "Nova")
+            active_app_target = "whatsapp"
+            conversation_history.append(
+                {"role": "user", "parts": [{"text": user_input}]}
+            )
+            conversation_history.append(
+                {"role": "model", "parts": [{"text": wa_result}]}
+            )
+            continue
+
+        # Deterministic shortcut: universal app operation command.
+        universal_cmd = _parse_universal_app_command(
+            user_input,
+            allow_context=bool(active_app_target),
+            active_target=active_app_target,
+        )
+        if universal_cmd is not None:
+            app_result = await execute_universal_app_workflow(
+                target=universal_cmd.get("target", ""),
+                open_target=bool(universal_cmd.get("open", False)),
+                search_query=universal_cmd.get("search_query"),
+                type_text=universal_cmd.get("type_text"),
+                send_now=True,
+            )
+            active_app_target = _normalize_target_name(universal_cmd.get("target", ""))
+            if active_app_target == "whatsapp":
+                whatsapp_context_active = True
+            print(app_result)
+            await speak(app_result)
+            log_message(app_result, "Nova")
+            conversation_history.append(
+                {"role": "user", "parts": [{"text": user_input}]}
+            )
+            conversation_history.append(
+                {"role": "model", "parts": [{"text": app_result}]}
+            )
+            continue
 
         # Deterministic shortcut: directly handle common accessibility command.
         if _is_screen_description_command(user_input):
