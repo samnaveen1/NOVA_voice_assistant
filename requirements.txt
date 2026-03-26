@@ -1,11 +1,15 @@
 python-dotenv
+flask
+flask-cors
+requests
+google-generativeai
+google-genai
+pymongo
 opencv-python
 mss
 Pillow
 selenium
 webdriver-manager
-google-generativeai
-google-genai
 edge-tts
 pygame
 pyautogui

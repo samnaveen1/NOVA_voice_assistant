@@ -1,8 +1,8 @@
-# Drishti – AI Assistant for the Blind
+# Nova – AI Assistant for the Blind
 
 HackOdisha 5.0 Submission | Assistive AI that sees, understands, and acts for you
 
-Drishti (meaning “vision” in Hindi) is an accessible AI assistant designed to empower blind and visually impaired users. It enables hands-free interaction with a PC via voice, describes the world and the screen in real-time using multimodal AI, and helps communicate through email and WhatsApp.
+Nova is an accessible AI assistant designed to empower blind and visually impaired users. It enables hands-free interaction with a PC via voice, describes the world and the screen in real-time using multimodal AI, and helps communicate through email and WhatsApp.
 
 ---
 
@@ -15,7 +15,7 @@ Drishti (meaning “vision” in Hindi) is an accessible AI assistant designed t
   - Fragmented workflows across messaging, email, browsing, and utilities
   - Cost, language support, and connectivity constraints limit access to advanced tools
 
-### How Drishti Helps
+### How Nova Helps
 - Multimodal understanding: Describes the screen and webcam view on demand, making visual context accessible in plain language
 - Voice-first control: Hands-free interaction for speed and ease
 - Unified assistant: Email, WhatsApp, web search, and on-screen descriptions from one place
@@ -118,13 +118,44 @@ Note: credentials.json and token.json are already git-ignored.
 - Launch the app:
   - python main.py
 
+### Chrome Extension Mode (New)
+This project now includes a Chrome extension UI that talks to a local Python backend.
+
+1. Install dependencies:
+  - pip install -r requirements.txt
+2. Run backend bridge:
+  - python chrome_backend.py
+3. Load extension in Chrome:
+  - Open chrome://extensions
+  - Turn on Developer mode
+  - Click Load unpacked
+  - Select the folder chrome_extension
+4. Open the extension popup and use:
+  - Ask: Send text query to Gemini via local backend
+  - Describe Page: Captures visible tab screenshot and asks Gemini to describe it
+  - Start Voice: Browser speech-to-text for dictation
+  - Always Listen: Enable wake-word mode and say "activate voice assistant"
+
+Wake-word workflow:
+- Keep python chrome_backend.py running.
+- In popup, enable Always listen for "activate voice assistant".
+- On any normal web page tab, say: activate voice assistant.
+- Assistant replies: How can I help you?
+- Speak your command, then extension sends it to backend and speaks response.
+
+Notes:
+- The extension uses http://127.0.0.1:5050 for backend API calls.
+- Keep chrome_backend.py running while using the extension.
+- API keys stay on backend side, not inside extension code.
+- Wake-word mode works on regular http/https pages (not chrome:// pages).
+
 If Selenium uses a headless Chrome, ensure Chrome is installed. WhatsApp automations open the desktop app; keep the machine unlocked.
 
 ---
 
 ## Usage Examples
-- “What’s on my screen?” → Drishti captures the display and describes key elements
-- “What’s in front of me?” → Drishti uses the webcam to describe surroundings
+- "What's on my screen?" → Nova captures the display and describes key elements
+- "What's in front of me?" → Nova uses the webcam to describe surroundings
 - “Send a WhatsApp to Papa: I reached safely” → Sends a message to a mapped contact
 - “Call Mom on WhatsApp, voice” → Initiates a WhatsApp voice call via UI automation
 - “Read my latest emails” → Summarizes recent inbox subjects
@@ -134,11 +165,12 @@ If Selenium uses a headless Chrome, ensure Chrome is installed. WhatsApp automat
 ---
 
 ## How It Works (High-Level)
-1. Listens for user input (currently via terminal input; Selenium web STT included and ready)
-2. Decides whether to answer directly or invoke tools (vision, email, search, etc.)
-3. Uses Gemini to summarize tool outputs and respond
-4. Speaks the result back using Edge TTS
-5. Logs the conversation and auto-summarizes when large
+1. Listens for user input via browser voice or terminal (Selenium web STT included)
+2. Waits for wake phrase "activate voice assistant"
+3. Decides whether to answer directly or invoke tools (vision, email, search, etc.)
+4. Uses Gemini to summarize tool outputs and respond
+5. Speaks the result back using Edge TTS or browser TTS
+6. Logs the conversation and auto-summarizes when large
 
 ---
 
@@ -156,4 +188,4 @@ If Selenium uses a headless Chrome, ensure Chrome is installed. WhatsApp automat
 MIT (or update as per your team’s preference)
 
 ## Attribution
-Built for HackOdisha 5.0 as an assistive technology prototype to enhance digital accessibility for blind and visually impaired users.
+Nova is an assistive technology to enhance digital accessibility for blind and visually impaired users. Originally built for HackOdisha 5.0.

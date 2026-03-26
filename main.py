@@ -3,14 +3,9 @@ import time
 import sys
 import warnings
 import re
+from datetime import datetime, timezone
+from uuid import uuid4
 from dotenv import load_dotenv
-
-# Suppress deprecation warning before importing deprecated SDK.
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    message=r"[\s\S]*google\.generativeai[\s\S]*"
-)
 
 import cv2  # For webcam access
 import mss  # For screen capture
@@ -28,6 +23,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 import google.generativeai as genai
 from google.genai import types
 
+# Hugging Face API (optional for future dual-provider mode)
+import requests
+import json
+
 # Edge TTS
 import edge_tts
 import asyncio
@@ -40,6 +39,7 @@ import pyautogui
 import pywhatkit
 from googlesearch import search
 import base64
+import io
 import os.path
 from email.mime.text import MIMEText
 from google.auth.transport.requests import Request
@@ -47,6 +47,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from pymongo import MongoClient
 
 # --- Constants ---
 # If modifying these scopes, delete the file token.json.
@@ -57,6 +58,7 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.readonly',
 LOG_FILE = "conversation_log.txt"
 MAX_LOG_SIZE_CHARS = 10000  # Max characters before summarization
 MAX_HISTORY_LENGTH = 20  # Max turns to keep in memory for immediate context
+SESSION_ID = str(uuid4())
 
 # TTS Constants
 VOICE = "en-US-JennyNeural"
@@ -68,25 +70,98 @@ load_dotenv()
 # IMPORTANT: Load API key from environment variable, do NOT hardcode it here.
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+HF_API_KEY = os.getenv("HF_API_KEY")
+HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+HF_VISION_MODEL = os.getenv("HF_VISION_MODEL", "Qwen/Qwen3.5-9B")
+ACTIVE_PROVIDER = os.getenv("ACTIVE_PROVIDER", "auto").strip().lower()
+MONGO_LOG_ENABLED = os.getenv("MONGO_LOG_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "nova_voice_ai")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "conversation_events")
 USE_VOICE_INPUT = os.getenv("USE_VOICE_INPUT", "true").strip().lower() in {
     "1", "true", "yes", "y", "on"
 }
 
-if not GOOGLE_API_KEY:
-    print("Error: GOOGLE_API_KEY not found in .env file.")
-    sys.exit(1)
+if ACTIVE_PROVIDER not in {"auto", "gemini", "huggingface"}:
+    ACTIVE_PROVIDER = "auto"
 
-genai.configure(api_key=GOOGLE_API_KEY)
+if ACTIVE_PROVIDER == "auto":
+    if GOOGLE_API_KEY:
+        ACTIVE_PROVIDER = "gemini"
+    elif HF_API_KEY:
+        ACTIVE_PROVIDER = "huggingface"
+
+if ACTIVE_PROVIDER == "gemini" and not GOOGLE_API_KEY:
+    if HF_API_KEY:
+        print("\033[93mGOOGLE_API_KEY missing. Falling back to Hugging Face mode.\033[0m")
+        ACTIVE_PROVIDER = "huggingface"
+    else:
+        print("Error: GOOGLE_API_KEY not found in .env file.")
+        sys.exit(1)
+
+if ACTIVE_PROVIDER == "huggingface" and not HF_API_KEY:
+    if GOOGLE_API_KEY:
+        print("\033[93mHF_API_KEY missing. Falling back to Gemini mode.\033[0m")
+        ACTIVE_PROVIDER = "gemini"
+    else:
+        print("Error: Set GOOGLE_API_KEY or HF_API_KEY in .env file.")
+        sys.exit(1)
+
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+
+HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
+
+# --- MongoDB Logging ---
+mongo_client = None
+mongo_collection = None
+
+
+def _init_mongo_logging():
+    global mongo_client, mongo_collection
+    if not MONGO_LOG_ENABLED:
+        print("\033[93mMongoDB logging disabled by configuration.\033[0m")
+        return
+
+    try:
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+        mongo_client.admin.command("ping")
+        mongo_collection = mongo_client[MONGO_DB_NAME][MONGO_COLLECTION_NAME]
+        print(
+            f"\033[94mMongoDB logging enabled: {MONGO_DB_NAME}.{MONGO_COLLECTION_NAME}\033[0m"
+        )
+    except Exception as e:
+        mongo_client = None
+        mongo_collection = None
+        print(f"\033[93mMongoDB unavailable, continuing with file logs only: {e}\033[0m")
+
+
+def _log_to_mongo(content: str, sender: str | None = None):
+    if mongo_collection is None:
+        return
+    try:
+        mongo_collection.insert_one({
+            "session_id": SESSION_ID,
+            "timestamp": datetime.now(timezone.utc),
+            "sender": sender or "system",
+            "content": content,
+            "provider": ACTIVE_PROVIDER,
+            "model": ACTIVE_MODEL,
+        })
+    except Exception as e:
+        print(f"\033[93mMongoDB log write failed: {e}\033[0m")
 
 # --- Initialize Gemini Model (SINGLE INSTANCE) ---
 SYSTEM_PROMPT = """
 <purpose>
-    Your purpose is to act as 'Drishti', a visionary AI assistant. 'Drishti' means 'vision' in Hindi, reflecting your core mission. You are a highly capable, empathetic, and patient personal assistant designed specifically to empower blind and disabled individuals. Your primary goal is to enhance their independence, improve their interaction with digital devices, and facilitate communication by being their eyes and hands in the digital and physical world.
+    Your purpose is to act as 'Nova', a visionary AI assistant designed to empower blind and disabled individuals by being their eyes and hands in the digital and physical world. You are a highly capable, empathetic, and patient personal assistant. Your primary goal is to enhance independence, improve interaction with digital devices, and facilitate communication.
 </purpose>
 
 <instructions>
     <instruction>
-        **Persona and Tone:** Embody 'Drishti'. Be empathetic, patient, and empowering. Your tone must always be clear, concise, and direct.
+        **Persona and Tone:** Embody 'Nova'. Be empathetic, patient, and empowering. Your tone must always be clear, concise, and direct.
     </instruction>
     <instruction>
         **Core Communication Rule:** Get straight to the point. Absolutely no conversational filler, preambles, or extra sentences (e.g., "Of course, I can help with that," or "Here is the information you requested.").
@@ -133,6 +208,18 @@ def _list_generate_content_models() -> list[str]:
     return available_models
 
 
+VISION_SYSTEM_PROMPT = """
+You are Nova, an accessibility assistant for blind users. When describing screen content:
+1. FOCUS ONLY on the main content area - ignore sidebars, toolbars, tabs, and navigation menus
+2. Describe in logical reading order: headings, body text, important controls, buttons, forms
+3. Be extremely concise - 2-3 sentences maximum for simple pages, 4-5 for complex ones
+4. Skip decorative elements, logos, background images
+5. Highlight interactive elements (links, buttons, input fields) by name and purpose
+6. Use plain language, no technical jargon
+7. If the page is mostly navigation/chrome, say 'This page contains primarily navigation controls'
+"""
+
+
 def _build_model_with_fallback(system_prompt: str):
     """Create model instance using configured model or best available fallback."""
     preferred_models = [
@@ -163,11 +250,17 @@ def _build_model_with_fallback(system_prompt: str):
     return model_instance, selected_model
 
 
-model, ACTIVE_MODEL = _build_model_with_fallback(SYSTEM_PROMPT)
+if ACTIVE_PROVIDER == "gemini":
+    model, ACTIVE_MODEL = _build_model_with_fallback(SYSTEM_PROMPT)
+else:
+    model = None
+    ACTIVE_MODEL = HF_MODEL
+
+_init_mongo_logging()
 
 
 def _extract_retry_seconds(error_text: str) -> int | None:
-    """Parse retry delay (if present) from Gemini quota error text."""
+    """Parse retry delay from error text if present."""
     match = re.search(r"Please retry in\s+([0-9]+(?:\.[0-9]+)?)s", error_text)
     if not match:
         return None
@@ -214,6 +307,75 @@ def _is_screen_description_command(user_text: str) -> bool:
     describe_keywords = ["describe", "what", "read", "tell", "see"]
     return any(k in normalized for k in screen_keywords) and any(k in normalized for k in describe_keywords)
 
+
+def _hf_generate_text(prompt: str, max_tokens: int = 512) -> str:
+    if not HF_API_KEY:
+        return "Hugging Face API key is missing."
+
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    payload = {
+        "model": HF_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+    }
+
+    try:
+        response = requests.post(HF_ROUTER_URL, headers=headers, json=payload, timeout=45)
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") or []
+        if choices:
+            message = choices[0].get("message") or {}
+            content = (message.get("content") or message.get("reasoning") or "").strip()
+            return content or "No response from model."
+        return "No response from model."
+    except Exception as e:
+        return f"Hugging Face request failed: {e}"
+
+
+def _hf_describe_image(pil_image: Image.Image, user_query: str) -> str:
+    if not HF_API_KEY:
+        return "Hugging Face API key is missing."
+
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="PNG")
+    image_b64 = base64.b64encode(buffer.getvalue()).decode()
+
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    payload = {
+        "model": HF_VISION_MODEL,
+        "messages": [
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_query},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                ],
+            },
+        ],
+        "max_tokens": 300,
+        "temperature": 0.2,
+    }
+
+    try:
+        response = requests.post(HF_ROUTER_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+
+        choices = data.get("choices") or []
+        if choices:
+            message = choices[0].get("message") or {}
+            text = (message.get("content") or message.get("reasoning") or "").strip()
+            return text or "I could not describe the image."
+        return "I could not describe the image."
+    except Exception as e:
+        return f"Image description failed: {e}"
+
 # --- Helper Functions ---
 
 
@@ -224,6 +386,7 @@ def log_message(content: str, sender: str = None):
             f.write(f"{sender}: {content}\n")
         else:
             f.write(f"{content}\n")
+    _log_to_mongo(content, sender)
 
 
 async def summarize_conversation_log(current_log_content: str) -> str:
@@ -236,6 +399,11 @@ async def summarize_conversation_log(current_log_content: str) -> str:
         f"\n\nConversation:\n{current_log_content}"
     )
     try:
+        if ACTIVE_PROVIDER == "huggingface":
+            summary = _hf_generate_text(summary_prompt, max_tokens=256).strip()
+            print(f"\033[95mConversation summarized. New context established.\033[0m")
+            return summary
+
         summary_response = await model.generate_content(
             summary_prompt,
             generation_config=genai.GenerationConfig(
@@ -502,17 +670,27 @@ stt_listener = None
 
 # --- Pygame-based TTS Function ---
 def remove_file(file_path):
-    max_attempts = 3
+    max_attempts = 8
     attempts = 0
     while attempts < max_attempts:
         try:
+            if pygame.mixer.get_init():
+                try:
+                    pygame.mixer.music.stop()
+                    pygame.mixer.music.unload()
+                except Exception:
+                    pass
+                try:
+                    pygame.mixer.quit()
+                except Exception:
+                    pass
             if os.path.exists(file_path):
                 os.remove(file_path)
             break
         except Exception as e:
             print(f"Error removing file '{file_path}': {e}")
             attempts += 1
-            time.sleep(0.1)
+            time.sleep(0.25)
 
 
 async def generate_tts(TEXT, output_file):
@@ -533,10 +711,16 @@ def play_audio(file_path):
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy():
             pygame.time.Clock().tick(10)
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        except Exception:
+            pass
         pygame.mixer.quit()
     except Exception as e:
         print(f"\033[91mError playing audio with Pygame: {e}\033[0m")
-        pygame.mixer.quit()
+        if pygame.mixer.get_init():
+            pygame.mixer.quit()
 
 
 async def speak(TEXT):
@@ -609,6 +793,9 @@ async def describe_webcam_view(user_query: str) -> str:
 
     if pil_image:
         try:
+            if ACTIVE_PROVIDER == "huggingface":
+                return _hf_describe_image(pil_image, user_query)
+
             # Rephrased prompt to avoid awkwardness with user_query
             contents_with_image = [
                 f"Analyze this webcam image and provide a short and concise description focusing on {user_query}.",
@@ -644,11 +831,18 @@ async def describe_screen_content(user_query: str) -> str:
 
     if pil_image:
         try:
-            # Rephrased prompt to avoid awkwardness with user_query
-            contents_with_image = [
-                f"Analyze this screen image and provide a short and concise description focusing on {user_query}.",
-                pil_image
-            ]
+            if ACTIVE_PROVIDER == "huggingface":
+                return _hf_describe_image(pil_image, user_query)
+
+            # Use vision system prompt with user query
+            prompt = (
+                f"User request: {user_query}\n\n"
+                "Analyze this screen and describe ONLY the main content area. "
+                "Ignore navigation menus, sidebars, toolbars, and tabs. "
+                "Be extremely concise (2-5 sentences max). "
+                "List important headings and interactive elements."
+            )
+            contents_with_image = [prompt, pil_image]
 
             response = model.generate_content(
                 contents=contents_with_image,
@@ -789,7 +983,8 @@ AVAILABLE_TOOLS = [
 
 
 async def main_conversation_loop():
-    print("Dhrishti: Hello! How can I assist you today? (Say 'exit' to quit)")
+    print("Nova: Hello! How can I assist you today? (Say 'exit' to quit)")
+    print(f"\033[94mActive provider: {ACTIVE_PROVIDER} ({ACTIVE_MODEL})\033[0m")
     await speak("Hello! How can I assist you today!")
 
     if USE_VOICE_INPUT and stt_listener:
@@ -815,7 +1010,7 @@ async def main_conversation_loop():
                 "\033[95mInitial conversation log exceeding limit. Summarizing...\033[0m")
             summary_text = await summarize_conversation_log(initial_log_content)
             with open(LOG_FILE, "w", encoding="utf-8") as f:  # Overwrite with summary
-                log_message(summary_text, sender="Dhrishti")
+                log_message(summary_text, sender="Nova")
             conversation_history.append({"role": "user", "parts": [
                                         {"text": f"Previous conversation summary: {summary_text}"}]})
         else:  # If not too large, just load it into history as a single block for initial context
@@ -833,7 +1028,7 @@ async def main_conversation_loop():
 
         if user_input is None or user_input.lower() == "exit":
             log_message("system", "User exited conversation.")
-            print("Dhrishti: Goodbye!")
+            print("Nova: Goodbye!")
             await speak("Goodbye!")
             break
 
@@ -848,7 +1043,7 @@ async def main_conversation_loop():
             screen_result = await describe_screen_content(user_input)
             print(screen_result)
             await speak(screen_result)
-            log_message(screen_result, "Dhrishti")
+            log_message(screen_result, "Nova")
             conversation_history.append(
                 {"role": "user", "parts": [{"text": user_input}]}
             )
@@ -864,6 +1059,24 @@ async def main_conversation_loop():
         # Trim conversation history to manage in-memory context window
         if len(conversation_history) > MAX_HISTORY_LENGTH:
             conversation_history = conversation_history[-(MAX_HISTORY_LENGTH):]
+
+        if ACTIVE_PROVIDER == "huggingface":
+            hf_prompt = (
+                f"{SYSTEM_PROMPT}\n\n"
+                f"Recent context: {conversation_history[-4:]}\n\n"
+                f"User: {user_input}\nAssistant:"
+            )
+            hf_response_text = _hf_generate_text(hf_prompt, max_tokens=512).strip()
+            if not hf_response_text:
+                hf_response_text = "I'm sorry, I couldn't generate a response."
+
+            print(hf_response_text)
+            await speak(hf_response_text)
+            log_message(hf_response_text, "Nova")
+            conversation_history.append(
+                {"role": "model", "parts": [{"text": hf_response_text}]}
+            )
+            continue
 
         try:
             response = model.generate_content(
@@ -961,19 +1174,19 @@ async def main_conversation_loop():
                         if final_text_response.strip():
                             print(final_text_response)
                             await speak(final_text_response)
-                            log_message(final_text_response, "Dhrishti")
+                            log_message(final_text_response, "Nova")
                             conversation_history.append(
                                 {"role": "model", "parts": [{"text": final_text_response}]})
                         else:
                             await speak("I performed the requested action successfully, but I have no further details to add.")
                             log_message(
-                                "Action performed, no further details.", "Dhrishti")
+                                "Action performed, no further details.", "Nova")
                             conversation_history.append(
                                 {"role": "model", "parts": [{"text": "Action performed, no further details."}]})
                     else:  # This path should ideally not be hit if tool_calls_to_execute was not empty
                         await speak("I performed an action, but there was no direct response.")
                         log_message(
-                            "Action performed, no direct response.", "Dhrishti")
+                            "Action performed, no direct response.", "Nova")
                         conversation_history.append(
                             {"role": "model", "parts": [{"text": "Action performed, no direct response."}]})
 
@@ -990,14 +1203,14 @@ async def main_conversation_loop():
                     if gemini_text_response.strip():
                         print(gemini_text_response)
                         await speak(gemini_text_response)
-                        log_message(gemini_text_response, "Dhrishti")
+                        log_message(gemini_text_response, "Nova")
                         conversation_history.append(
                             {"role": "model", "parts": [{"text": gemini_text_response}]})
                     else:
                         print(
                             "\033[91mGemini returned an empty text response.\033[0m")
                         await speak("I'm sorry, I couldn't generate a response.")
-                        log_message("Empty response from Gemini.", "Dhrishti")
+                        log_message("Empty response from Gemini.", "Nova")
                         conversation_history.append({"role": "model", "parts": [
                                                     {"text": "I'm sorry, I couldn't generate a response."}]})
             else:
@@ -1005,7 +1218,7 @@ async def main_conversation_loop():
                     "\033[91mGemini did not return a response or candidate.\033[0m")
                 await speak("I'm sorry, I couldn't generate a response.")
                 log_message(
-                    "No candidate or response from Gemini.", "Dhrishti")
+                    "No candidate or response from Gemini.", "Nova")
                 conversation_history.append({"role": "model", "parts": [
                                             {"text": "I'm sorry, I couldn't generate a response."}]})
 
@@ -1071,7 +1284,7 @@ if __name__ == "__main__":
                 )
         asyncio.run(main_conversation_loop())
     except KeyboardInterrupt:
-        print("\nDhrishti: Conversation interrupted. Exiting.")
+        print("\nNova: Conversation interrupted. Exiting.")
         if stt_listener:
             stt_listener.close()
     except Exception as e:

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nova</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <h1>Nova</h1>
+      <p class="subtitle">Accessibility assistant for this browser tab</p>
+
+      <textarea id="query" rows="4" placeholder="Type a request like: summarize this page"></textarea>
+
+      <div class="row">
+        <button id="askBtn">Ask</button>
+        <button id="pageBtn">Describe Page</button>
+      </div>
+
+      <div class="row">
+        <button id="listenBtn">Start Voice</button>
+        <button id="stopBtn" disabled>Stop Voice</button>
+      </div>
+
+      <label class="speakToggle">
+        <input id="autoSpeak" type="checkbox" checked />
+        Speak responses
+      </label>
+
+      <label class="speakToggle">
+        <input id="wakeMode" type="checkbox" checked />
+        Always listen for "activate voice assistant"
+      </label>
+
+      <div class="row">
+        <button id="wakeStartBtn">Re-sync Wake</button>
+        <button id="wakePingBtn">Wake Status</button>
+      </div>
+
+      <pre id="status">Ready.</pre>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
